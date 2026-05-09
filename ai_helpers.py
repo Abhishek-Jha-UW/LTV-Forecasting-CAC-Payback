@@ -10,7 +10,7 @@ import json
 from typing import Any
 
 import pandas as pd
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 
 class SyntheticOrder(BaseModel):
@@ -18,11 +18,34 @@ class SyntheticOrder(BaseModel):
     order_date: str = Field(description="ISO date YYYY-MM-DD")
     revenue: float = Field(ge=0)
 
-    @field_validator("order_date")
+    @field_validator("customer_id", mode="before")
     @classmethod
-    def iso_date(cls, v: str) -> str:
-        pd.to_datetime(v)
-        return v
+    def coerce_customer_id(cls, v: Any) -> str:
+        """OpenAI often emits numeric IDs in JSON; normalize to string."""
+        if v is None:
+            raise ValueError("customer_id is required")
+        s = str(v).strip()
+        if not s:
+            raise ValueError("customer_id cannot be empty")
+        return s
+
+    @field_validator("revenue", mode="before")
+    @classmethod
+    def coerce_revenue(cls, v: Any) -> float:
+        if v is None:
+            raise ValueError("revenue is required")
+        return float(v)
+
+    @field_validator("order_date", mode="before")
+    @classmethod
+    def coerce_order_date(cls, v: Any) -> str:
+        if v is None:
+            raise ValueError("order_date is required")
+        if hasattr(v, "isoformat"):
+            return str(v.isoformat())[:10]
+        s = str(v).strip()
+        pd.to_datetime(s)
+        return s
 
 
 class SyntheticDataset(BaseModel):
@@ -37,9 +60,14 @@ class ColumnMappingSuggestion(BaseModel):
 
 
 SYNTHETIC_SYSTEM_PROMPT = """You output only valid JSON for a purchase transaction dataset.
-Each order must have customer_id, order_date (YYYY-MM-DD), revenue (non-negative float).
-No markdown, no commentary. Dates must fall within the user's requested window.
-Create realistic repeat purchase patterns (some one-time, some loyal)."""
+Top-level key must be "orders" (array). Each element: customer_id, order_date, revenue.
+
+Rules:
+- customer_id: use stable string identifiers in JSON (e.g. "S00042", "cust_12"). Quoted strings only — do not use bare integers for customer_id.
+- order_date: "YYYY-MM-DD" strings only; must fall within the user's requested window.
+- revenue: non-negative number (subscription MRR or order totals in USD).
+No markdown, no commentary.
+Create realistic repeat patterns (some one-time, some loyal); for SaaS prefer monthly renewal rows."""
 
 
 INSIGHT_SYSTEM_PROMPT = """You are a senior data scientist writing concise, accurate takeaways for revenue leaders.
@@ -157,6 +185,7 @@ def generate_synthetic_orders(
             "constraints": {
                 "max_orders_per_customer": 40,
                 "revenue_range_hint_usd": [5, 500],
+                "customer_id_must_be_string": True,
             },
         }
     )
@@ -182,6 +211,13 @@ def generate_synthetic_orders(
         df["order_date"] = pd.to_datetime(df["order_date"]).dt.normalize()
         df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
         return df, None
+    except ValidationError as exc:
+        errs = exc.errors()[:6]
+        summary = "; ".join(
+            f"{'/'.join(str(x) for x in e['loc'])}: {e['msg']}" for e in errs
+        )
+        n = len(exc.errors())
+        return None, f"AI JSON failed validation ({n} issue(s)). First examples: {summary}"
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)
 
