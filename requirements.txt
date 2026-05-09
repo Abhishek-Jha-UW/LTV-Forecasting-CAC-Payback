@@ -6,3 +6,4 @@ scipy>=1.11,<2
 openai>=1.30,<2
 pydantic>=2.0,<3
 lifetimes>=0.11.3,<0.12
+openpyxl>=3.1,<4

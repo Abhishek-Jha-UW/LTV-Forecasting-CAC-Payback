@@ -7,8 +7,12 @@ Streamlit portfolio app for **probabilistic customer lifetime value (CLV)** and 
 - **Dual demo datasets**
   - *Subscription MRR*: monthly renewal rows — aligns well with retention + payback sliders.
   - *Ecommerce repeat purchases*: irregular orders — good fit for BG/NBD / Gamma-Gamma CLV.
-- **Upload your own CSV** with columns `customer_id`, `order_date`, `revenue`.
-- **OpenAI (optional)**: JSON-mode synthetic order generation; insight memo from **aggregated metrics only** (no raw row dump to the model by default).
+- **Upload CSV or Excel** and map columns with dropdowns; optional **AI column suggestion** (maps only to existing headers — you confirm before apply).
+- **Templates**: `templates/transactions_template.csv` plus in-app **CSV & Excel** downloads.
+- **Methodology tab**: plain-language description of BG/NBD, cohort decay proxy, payback math, and SaaS benchmark.
+- **Industry lens**: guidance text only (does not swap hidden models).
+- **SaaS steady-state LTV** benchmark tab: ARPA × margin ÷ churn with optional fill-from-data heuristics.
+- **OpenAI (optional)**: synthetic orders + insight memo; **`gpt-4o-mini` only** (predictable cost). Key via **secrets only** — no key entry in the UI.
 - **Secrets-ready** for [Streamlit Community Cloud](https://streamlit.io/cloud): `OPENAI_API_KEY` in app secrets.
 
 ## Quick start
@@ -24,7 +28,7 @@ streamlit run app.py
 
 1. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`.
 2. Set `OPENAI_API_KEY` (never commit `secrets.toml` — it is gitignored).
-3. Optional: `OPENAI_MODEL = "gpt-4o-mini"` (or another chat model your key supports).
+3. The app calls **`gpt-4o-mini`** only (no model override in secrets).
 
 On Streamlit Cloud: **App settings → Secrets** and paste the same TOML.
 
@@ -47,8 +51,10 @@ On Streamlit Cloud: **App settings → Secrets** and paste the same TOML.
 | File | Role |
 |------|------|
 | `app.py` | Streamlit UI |
-| `model.py` | Data generators, RFM, BG/NBD + GG, cohorts, payback math |
-| `ai_helpers.py` | OpenAI JSON synthetic data + insight memo |
+| `model.py` | Data generators, RFM, BG/NBD + GG, cohorts, payback math, SaaS helpers |
+| `ai_helpers.py` | OpenAI JSON synthetic data, column mapping suggestion, insight memo |
+| `templates/transactions_template.csv` | Sample upload schema |
+| `info/how_the_project_works.txt` | Plain-text walkthrough |
 | `requirements.txt` | Pinned dependency ranges |
 | `.streamlit/config.toml` | Theme / server defaults |
 | `.streamlit/secrets.toml.example` | Template for secrets |

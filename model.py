@@ -320,6 +320,7 @@ def fit_monthly_retention_geometric(
         return 0.9, pd.DataFrame()
 
     ser = pd.Series(ratios).sort_index()
+    ser.index.name = "period_index"
     y = np.log(ser.values)
     x = ser.index.values.astype(float)
 
@@ -377,6 +378,105 @@ def scenario_grid(
                 }
             )
     return pd.DataFrame.from_records(records)
+
+
+def guess_column_mapping(columns: list[str]) -> tuple[str | None, str | None, str | None]:
+    """Map common header names to (customer, date, revenue). Names must match original column strings."""
+    lower_map = {str(c).strip().lower(): c for c in columns}
+
+    def pick(keys: list[str]) -> str | None:
+        for k in keys:
+            if k in lower_map:
+                return lower_map[k]
+        return None
+
+    cust = pick(
+        [
+            "customer_id",
+            "cust_id",
+            "user_id",
+            "account_id",
+            "client_id",
+            "customer",
+            "id",
+        ]
+    )
+    dt = pick(
+        [
+            "order_date",
+            "purchase_date",
+            "transaction_date",
+            "renewal_date",
+            "invoice_date",
+            "date",
+            "period",
+        ]
+    )
+    rev = pick(
+        [
+            "revenue",
+            "amount",
+            "sales",
+            "total",
+            "mrr",
+            "arr",
+            "value",
+            "price",
+            "payment",
+        ]
+    )
+    return cust, dt, rev
+
+
+def standardize_transaction_columns(
+    df: pd.DataFrame,
+    customer_col: str,
+    date_col: str,
+    revenue_col: str,
+) -> pd.DataFrame:
+    """Return canonical columns customer_id, order_date, revenue."""
+    out = df[[customer_col, date_col, revenue_col]].copy()
+    out.columns = ["customer_id", "order_date", "revenue"]
+    out["order_date"] = pd.to_datetime(out["order_date"], utc=True, errors="coerce").dt.tz_convert(None)
+    out["order_date"] = out["order_date"].dt.normalize()
+    out["revenue"] = pd.to_numeric(out["revenue"], errors="coerce")
+    out = out.dropna(subset=["customer_id", "order_date", "revenue"])
+    out["customer_id"] = out["customer_id"].astype(str)
+    return out.reset_index(drop=True)
+
+
+def saas_ltv_steady_state(
+    arpa_monthly: float,
+    contribution_margin_fraction: float,
+    monthly_churn: float,
+) -> float | None:
+    """
+    Classic steady-state approximation: LTV ≈ ARPA × margin ÷ monthly_churn.
+    contribution_margin_fraction is 0–1 (e.g. 0.75 for 75% CM).
+    """
+    if monthly_churn <= 0 or contribution_margin_fraction < 0:
+        return None
+    return float(arpa_monthly * contribution_margin_fraction / monthly_churn)
+
+
+def estimate_arpa_and_churn_heuristic(
+    df: pd.DataFrame,
+    cohort_retention_monthly: float | None,
+) -> tuple[float | None, float | None]:
+    """
+    Heuristic ARPA: average of per-customer mean revenue per row (reasonable for flat subscription MRR rows).
+    Heuristic churn: 1 − r when r is cohort revenue-retention factor from fit_monthly_retention_geometric.
+    """
+    if df.empty or "customer_id" not in df.columns:
+        return None, None
+    per_cust_mean = df.groupby("customer_id", sort=False)["revenue"].mean()
+    arpa = float(per_cust_mean.mean()) if len(per_cust_mean) else None
+    churn: float | None = None
+    if cohort_retention_monthly is not None and np.isfinite(cohort_retention_monthly):
+        r = float(cohort_retention_monthly)
+        if 0 < r < 1:
+            churn = float(np.clip(1.0 - r, 0.001, 0.99))
+    return arpa, churn
 
 
 def validate_transactions_df(
