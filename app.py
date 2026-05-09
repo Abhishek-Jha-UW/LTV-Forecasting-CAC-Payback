@@ -326,19 +326,27 @@ def main() -> None:
         else:
             st.session_state.upload_raw_df = None
             st.session_state.upload_hash = None
-            st.caption("API key from Streamlit secrets only (`OPENAI_API_KEY`). Uses **gpt-4o-mini**.")
-            if not _openai_ready():
-                st.warning("Add `OPENAI_API_KEY` in app secrets to enable generation.")
+            st.caption(
+                "Contexts that look like **SaaS / subscriptions** use a built-in monthly renewal simulator "
+                "(no API key). Other industries call **gpt-4o-mini** via secrets."
+            )
             n_c = st.slider("Target distinct customers", 40, 400, 120, 10)
             ind_ctx = st.text_input("Industry / product context", "B2B SaaS analytics product")
             d0 = st.date_input("Start", value=pd.Timestamp("2023-01-01"))
             d1 = st.date_input("End", value=pd.Timestamp("2024-12-01"))
+            sub_like = ai_helpers.is_subscription_like_industry(ind_ctx)
+            if not _openai_ready() and not sub_like:
+                st.warning("Add `OPENAI_API_KEY` in app secrets for non-subscription industries.")
             if st.button("Generate dataset", type="primary"):
-                client = ai_helpers.get_openai_client(ai_helpers.resolve_openai_key(_get_secrets()))
-                if client is None:
+                client = (
+                    ai_helpers.get_openai_client(ai_helpers.resolve_openai_key(_get_secrets()))
+                    if not sub_like
+                    else None
+                )
+                if not sub_like and client is None:
                     st.error("Missing API key in secrets.")
                 else:
-                    df_ai, err = ai_helpers.generate_synthetic_orders(
+                    df_ai, err, gen_notice = ai_helpers.generate_synthetic_orders(
                         client,
                         n_customers=n_c,
                         start_date=str(d0),
@@ -348,13 +356,17 @@ def main() -> None:
                     if err:
                         st.error(err)
                     elif df_ai is not None:
+                        if gen_notice:
+                            st.info(gen_notice)
                         issues = model.validate_transactions_df(df_ai, "customer_id", "order_date", "revenue")
                         if issues:
                             for msg in issues:
                                 st.error(msg)
                         else:
                             st.session_state.tx_df = df_ai
-                            st.success(f"Generated {len(df_ai):,} orders.")
+                            st.success(
+                                f"Ready: **{df_ai['customer_id'].nunique():,}** customers, **{len(df_ai):,}** orders."
+                            )
                             st.rerun()
 
         st.divider()

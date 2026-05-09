@@ -12,6 +12,8 @@ from typing import Any
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+import model as model_layer
+
 
 class SyntheticOrder(BaseModel):
     customer_id: str
@@ -59,15 +61,23 @@ class ColumnMappingSuggestion(BaseModel):
     notes: str = ""
 
 
-SYNTHETIC_SYSTEM_PROMPT = """You output only valid JSON for a purchase transaction dataset.
-Top-level key must be "orders" (array). Each element: customer_id, order_date, revenue.
+SYNTHETIC_SYSTEM_PROMPT_ECOMMERCE = """You output only valid JSON: top-level key "orders" (array).
+Each element: customer_id (string), order_date ("YYYY-MM-DD"), revenue (non-negative number).
 
-Rules:
-- customer_id: use stable string identifiers in JSON (e.g. "S00042", "cust_12"). Quoted strings only — do not use bare integers for customer_id.
-- order_date: "YYYY-MM-DD" strings only; must fall within the user's requested window.
-- revenue: non-negative number (subscription MRR or order totals in USD).
-No markdown, no commentary.
-Create realistic repeat patterns (some one-time, some loyal); for SaaS prefer monthly renewal rows."""
+E-commerce / retail pattern:
+- Aim for roughly the requested distinct customer_id values (strings like "C0042").
+- Many customers should have MULTIPLE orders across different dates (repeat buyers).
+- Revenue varies by order (basket sizes differ).
+- Include some one-time buyers and some loyal repeaters.
+- Dates must fall strictly within the user's start_date..end_date window.
+No markdown or commentary."""
+
+SYNTHETIC_SYSTEM_PROMPT_ECOMMERCE_RETRY = """Same JSON schema as before. Your previous output was rejected for being too sparse.
+Requirements:
+- Average orders per customer MUST exceed 1.5.
+- At least half of customers must have 2+ orders.
+- Spread orders across the date range (not all on one day).
+Output compact JSON only."""
 
 
 INSIGHT_SYSTEM_PROMPT = """You are a senior data scientist writing concise, accurate takeaways for revenue leaders.
@@ -110,6 +120,42 @@ def resolve_openai_key(st_secrets: Any | None, environ: dict[str, str] | None = 
 def openai_model() -> str:
     """Always use the cheapest suitable chat model for this app."""
     return DEFAULT_OPENAI_MODEL
+
+
+_SUBSCRIPTION_INDUSTRY_HINTS = (
+    "saas",
+    "subscription",
+    "recurring",
+    "mrr",
+    "arr",
+    "software as a service",
+    "b2b software",
+    "membership",
+    "monthly billing",
+    "annual contract",
+)
+
+
+def is_subscription_like_industry(industry: str) -> bool:
+    """Heuristic: subscription-style businesses need dense renewal rows (LLMs rarely produce enough)."""
+    s = industry.lower()
+    return any(h in s for h in _SUBSCRIPTION_INDUSTRY_HINTS)
+
+
+def validate_ecommerce_density(df: pd.DataFrame, n_target: int) -> tuple[bool, str]:
+    """Reject sparse AI outputs that break cohort / BG-NBD demos."""
+    if df.empty:
+        return False, "empty dataframe"
+    nu = int(df["customer_id"].nunique())
+    if nu < max(5, int(n_target * 0.65)):
+        return False, f"too few customers ({nu} vs target ~{n_target})"
+    per = df.groupby("customer_id").size()
+    mo = float(per.mean())
+    if mo < 1.45:
+        return False, f"mean orders/customer {mo:.2f} (need clearer repeat-purchase signal)"
+    if float((per >= 2).mean()) < 0.48:
+        return False, "need ≥48% of customers with 2+ orders"
+    return True, "ok"
 
 
 def validate_column_mapping(suggestion: ColumnMappingSuggestion, allowed: list[str]) -> str | None:
@@ -164,62 +210,140 @@ def suggest_column_mapping(
         return None, str(exc)
 
 
+def _payload_to_orders_df(payload: dict[str, Any]) -> pd.DataFrame:
+    if "orders" not in payload and isinstance(payload, list):
+        payload = {"orders": payload}
+    dataset = SyntheticDataset.model_validate(payload)
+    df = pd.DataFrame([o.model_dump() for o in dataset.orders])
+    if df.empty:
+        raise ValueError("Model returned zero orders.")
+    df["order_date"] = pd.to_datetime(df["order_date"]).dt.normalize()
+    return df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
+
+
 def generate_synthetic_orders(
-    client,
+    client: Any | None,
     *,
     n_customers: int,
     start_date: str,
     end_date: str,
     industry: str,
-) -> tuple[pd.DataFrame | None, str | None]:
+) -> tuple[pd.DataFrame | None, str | None, str | None]:
     """
-    Returns (dataframe, error_message).
-    """
-    user_prompt = json.dumps(
-        {
-            "task": "generate_orders",
-            "n_customers": n_customers,
-            "start_date": start_date,
-            "end_date": end_date,
-            "industry": industry,
-            "constraints": {
-                "max_orders_per_customer": 40,
-                "revenue_range_hint_usd": [5, 500],
-                "customer_id_must_be_string": True,
-            },
-        }
-    )
+    Returns (dataframe, error_message, info_banner).
 
-    try:
+    Subscription-like industries use the built-in renewal simulator so cohort charts stay realistic.
+    E-commerce uses OpenAI with density checks, one retry, then programmatic fallback.
+    """
+    notice: str | None = None
+
+    if is_subscription_like_industry(industry):
+        seed = abs(hash((industry.strip().lower(), start_date, end_date, int(n_customers)))) % (2**31 - 1)
+        df = model_layer.demo_subscription_mrr_data(
+            n_customers=int(n_customers),
+            seed=int(seed),
+            start=start_date,
+            end=end_date,
+        )
+        notice = (
+            f"Subscription-style industry text detected: using the **built-in monthly renewal simulator** "
+            f"({df['customer_id'].nunique():,} customers, **{len(df):,} renewal rows**) "
+            "so averages and cohort curves look like real SaaS telemetry. "
+            "OpenAI is skipped here (language models usually produce too few renewals per customer and hit output limits)."
+        )
+        return df, None, notice
+
+    if client is None:
+        return None, "Missing API key in secrets (required for non-subscription industries).", None
+
+    base_user = {
+        "task": "generate_orders",
+        "n_customers": n_customers,
+        "start_date": start_date,
+        "end_date": end_date,
+        "industry": industry,
+        "constraints": {
+            "customer_id_must_be_quoted_string": True,
+            "min_mean_orders_per_customer": 1.5,
+            "min_fraction_customers_with_repeat": 0.5,
+            "max_orders_per_customer": 45,
+            "revenue_range_hint_usd": [8, 750],
+        },
+    }
+
+    def _call_llm(system: str, user_obj: dict[str, Any], temperature: float) -> pd.DataFrame:
         resp = client.chat.completions.create(
             model=openai_model(),
-            temperature=0.65,
+            temperature=temperature,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": SYNTHETIC_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user_obj)},
             ],
+            max_tokens=8192,
         )
         content = resp.choices[0].message.content or "{}"
         payload = json.loads(content)
-        if "orders" not in payload and isinstance(payload, list):
-            payload = {"orders": payload}
-        dataset = SyntheticDataset.model_validate(payload)
-        df = pd.DataFrame([o.model_dump() for o in dataset.orders])
-        if df.empty:
-            return None, "Model returned zero orders."
-        df["order_date"] = pd.to_datetime(df["order_date"]).dt.normalize()
-        df = df.sort_values(["customer_id", "order_date"]).reset_index(drop=True)
-        return df, None
+        return _payload_to_orders_df(payload)
+
+    try:
+        df = _call_llm(SYNTHETIC_SYSTEM_PROMPT_ECOMMERCE, base_user, temperature=0.55)
+        ok, reason = validate_ecommerce_density(df, n_customers)
+        if not ok:
+            df2 = _call_llm(
+                SYNTHETIC_SYSTEM_PROMPT_ECOMMERCE_RETRY,
+                {**base_user, "previous_rejection": reason},
+                temperature=0.28,
+            )
+            ok2, reason2 = validate_ecommerce_density(df2, n_customers)
+            if ok2:
+                df = df2
+                notice = (
+                    f"First AI draft was sparse ({reason}); **second attempt** passed density checks "
+                    f"({df['customer_id'].nunique():,} customers, mean {len(df)/df['customer_id'].nunique():.1f} orders each)."
+                )
+            else:
+                seed = abs(hash((industry, start_date, end_date, n_customers, "fallback"))) % (2**31 - 1)
+                df = model_layer.demo_transaction_data(
+                    n_customers=int(n_customers),
+                    seed=int(seed),
+                    start=start_date,
+                    end=end_date,
+                )
+                notice = (
+                    f"AI output still looked unrealistic ({reason2}). "
+                    f"Loaded **built-in ecommerce repeat-purchase simulator** instead "
+                    f"({df['customer_id'].nunique():,} customers, {len(df):,} orders)."
+                )
+        return df, None, notice
     except ValidationError as exc:
         errs = exc.errors()[:6]
         summary = "; ".join(
             f"{'/'.join(str(x) for x in e['loc'])}: {e['msg']}" for e in errs
         )
         n = len(exc.errors())
-        return None, f"AI JSON failed validation ({n} issue(s)). First examples: {summary}"
+        seed = abs(hash((start_date, end_date, n_customers, "val_err"))) % (2**31 - 1)
+        df = model_layer.demo_transaction_data(
+            n_customers=int(n_customers),
+            seed=int(seed),
+            start=start_date,
+            end=end_date,
+        )
+        notice = (
+            f"AI JSON failed validation ({n} issue(s)): {summary}. "
+            f"Using **built-in ecommerce simulator** ({len(df):,} orders)."
+        )
+        return df, None, notice
     except Exception as exc:  # noqa: BLE001
-        return None, str(exc)
+        seed = abs(hash((start_date, end_date, n_customers, "exc"))) % (2**31 - 1)
+        df = model_layer.demo_transaction_data(
+            n_customers=int(n_customers),
+            seed=int(seed),
+            start=start_date,
+            end=end_date,
+        )
+        notice = f"OpenAI error ({exc}). Using built-in ecommerce simulator ({len(df):,} orders)."
+        return df, None, notice
 
 
 def generate_insights(client, *, metrics: dict[str, Any]) -> tuple[str | None, str | None]:

@@ -13,6 +13,7 @@ Streamlit portfolio app for **probabilistic customer lifetime value (CLV)** and 
 - **Industry lens**: guidance text only (does not swap hidden models).
 - **SaaS steady-state LTV** benchmark tab: ARPA × margin ÷ churn with optional fill-from-data heuristics.
 - **OpenAI (optional)**: synthetic orders + insight memo; **`gpt-4o-mini` only** (predictable cost). Key via **secrets only** — no key entry in the UI.
+- **Generate dataset**: If your industry text looks like **SaaS / subscriptions**, the app uses a **built-in monthly renewal simulator** (dense, realistic rows per customer). Other industries use OpenAI with density checks and fall back to a programmatic ecommerce simulator if the model is too sparse.
 - **Secrets-ready** for [Streamlit Community Cloud](https://streamlit.io/cloud): `OPENAI_API_KEY` in app secrets.
 
 ## Quick start
