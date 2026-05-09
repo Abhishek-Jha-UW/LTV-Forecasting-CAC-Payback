@@ -12,7 +12,6 @@ Model is fixed to gpt-4o-mini for predictable cost.
 from __future__ import annotations
 
 import io
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -24,8 +23,15 @@ import streamlit as st
 import ai_helpers
 import model
 
-BASE_DIR = Path(__file__).resolve().parent
-TEMPLATE_CSV = BASE_DIR / "templates" / "transactions_template.csv"
+# Bundled in code so Streamlit Cloud never depends on an on-disk template path.
+TRANSACTION_TEMPLATE_CSV = """customer_id,order_date,revenue
+C00001,2024-01-15,99.00
+C00001,2024-02-15,99.00
+C00001,2024-03-15,99.00
+C00002,2024-01-20,149.50
+C00002,2024-02-20,149.50
+C00003,2024-03-01,49.99
+"""
 
 INDUSTRY_GUIDANCE: dict[str, str] = {
     "General / mixed": (
@@ -98,11 +104,11 @@ def _openai_ready() -> bool:
 
 
 def _template_csv_bytes() -> bytes:
-    return TEMPLATE_CSV.read_bytes()
+    return TRANSACTION_TEMPLATE_CSV.encode("utf-8")
 
 
 def _template_xlsx_bytes() -> bytes:
-    df = pd.read_csv(TEMPLATE_CSV)
+    df = pd.read_csv(io.StringIO(TRANSACTION_TEMPLATE_CSV))
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="transactions")
